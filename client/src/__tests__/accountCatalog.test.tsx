@@ -1,0 +1,379 @@
+﻿// @vitest-environment jsdom
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { MemoryRouter } from 'react-router-dom';
+import { ToastProvider } from '../components/ui/Toast';
+import { AccountPage } from '../features/auth/AccountPage';
+import { AdminUsers } from '../features/admin/Users';
+import { AdminToppings } from '../features/admin/Toppings';
+import { PaymentAccounting } from '../features/staff/PaymentAccounting';
+
+const mock = vi.hoisted(() => ({
+  get: vi.fn(),
+  post: vi.fn(),
+  patch: vi.fn(),
+  delete: vi.fn(),
+  setState: vi.fn(),
+  clearSession: vi.fn(),
+  user: { id: 'self', name: 'Quản lý', email: 'admin@test.vn', role: 'ADMIN' as 'ADMIN' | 'STAFF' },
+}));
+vi.mock('../lib/api', async (original) => ({
+  ...(await original<typeof import('../lib/api')>()),
+  api: mock,
+}));
+vi.mock('../features/auth/useAuth', () => ({
+  useAuth: Object.assign(
+    (selector: (state: { user: typeof mock.user }) => unknown) => selector({ user: mock.user }),
+    { setState: mock.setState, getState: () => ({ clearSession: mock.clearSession }) },
+  ),
+}));
+const response = (data: unknown) => ({ data: { success: true, data } });
+const clients: QueryClient[] = [];
+function mount(ui: React.ReactNode) {
+  const qc = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  clients.push(qc);
+  render(
+    <MemoryRouter>
+      <QueryClientProvider client={qc}>
+        <ToastProvider>{ui}</ToastProvider>
+      </QueryClientProvider>
+    </MemoryRouter>,
+  );
+}
+afterEach(() => {
+  cleanup();
+  for (const qc of clients.splice(0)) qc.clear();
+  vi.resetAllMocks();
+  mock.user.role = 'ADMIN';
+});
+
+describe('accounts, toppings and compact receipts', () => {
+  it('requires an explicit admin confirmation and reason, then applies directly instead of queuing', async () => {
+    mock.get.mockResolvedValue(
+      response({
+        items: [
+          {
+            id: 'receipt-original',
+            amount: 35000,
+            method: 'CASH',
+            status: 'SUCCESS',
+            paidAt: '2026-11-17T02:00:00Z',
+            orders: [{ tableName: 'Bàn 01', code: 'hidden' }],
+          },
+        ],
+        total: 1,
+        corrections: [],
+        targets: [],
+      }),
+    );
+    mock.post.mockResolvedValue(response({ status: 'APPROVED' }));
+    mount(<PaymentAccounting admin />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Điều chỉnh' }));
+    const confirm = screen.getByRole('button', {
+      name: 'Lưu điều chỉnh',
+    }) as HTMLButtonElement;
+    expect(confirm.disabled).toBe(true);
+    expect(screen.queryByRole('button', { name: 'Gửi quản lý duyệt' })).toBeNull();
+    expect(mock.post).not.toHaveBeenCalled();
+    fireEvent.change(screen.getByLabelText('Lý do'), {
+      target: { value: 'Đã kiểm tra chuyển khoản' },
+    });
+    expect(confirm.disabled).toBe(false);
+    fireEvent.click(confirm);
+    await waitFor(() =>
+      expect(mock.post).toHaveBeenCalledExactlyOnceWith(
+        '/admin/payments/receipt-original/corrections/apply',
+        { kind: 'METHOD', reason: 'Đã kiểm tra chuyển khoản', method: 'BANK_TRANSFER' },
+      ),
+    );
+    await screen.findByText('Đã điều chỉnh khoản thu');
+    expect(screen.queryByRole('dialog')).toBeNull();
+  });
+
+  it('applies an admins old pending adjustment in one click without another review dialog', async () => {
+    mock.get.mockResolvedValue(
+      response({
+        items: [],
+        total: 0,
+        targets: [],
+        corrections: [
+          {
+            _id: 'own-pending',
+            paymentId: 'receipt',
+            requestedBy: 'self',
+            requestedByName: 'Quản lý',
+            status: 'REQUESTED',
+            kind: 'METHOD',
+            method: 'BANK_TRANSFER',
+            reason: 'Ghi nhầm phương thức',
+            version: 0,
+          },
+        ],
+      }),
+    );
+    mock.post.mockResolvedValue(response({ status: 'APPROVED' }));
+    mount(<PaymentAccounting admin />);
+    const apply = await screen.findByRole('button', { name: 'Áp dụng điều chỉnh' });
+    expect(mock.post).not.toHaveBeenCalled();
+    fireEvent.click(apply);
+    expect(screen.queryByRole('dialog')).toBeNull();
+    await waitFor(() =>
+      expect(mock.post).toHaveBeenCalledExactlyOnceWith(
+        '/admin/payment-corrections/own-pending/decision',
+        { approve: true, expectedVersion: 0, note: 'Ghi nhầm phương thức' },
+      ),
+    );
+  });
+
+  it('still requires an admin review before applying a staff request', async () => {
+    mock.get.mockResolvedValue(
+      response({
+        items: [],
+        total: 0,
+        targets: [],
+        corrections: [
+          {
+            _id: 'staff-pending',
+            requestedBy: 'staff-other',
+            requestedByName: 'Nhân viên',
+            status: 'REQUESTED',
+            kind: 'VOID',
+            reason: 'Thu nhầm đơn',
+            version: 0,
+          },
+        ],
+      }),
+    );
+    mock.post.mockResolvedValue(response({ status: 'APPROVED' }));
+    mount(<PaymentAccounting admin />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Kiểm tra & duyệt' }));
+    expect(screen.getByRole('dialog')).toBeTruthy();
+    expect(mock.post).not.toHaveBeenCalled();
+    fireEvent.change(screen.getByLabelText('Ghi chú kiểm tra'), {
+      target: { value: 'Đã kiểm tra' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Xác nhận duyệt' }));
+    await waitFor(() =>
+      expect(mock.post).toHaveBeenCalledExactlyOnceWith(
+        '/admin/payment-corrections/staff-pending/decision',
+        { approve: true, expectedVersion: 0, note: 'Đã kiểm tra' },
+      ),
+    );
+  });
+
+  it('uses table and time to distinguish transfer targets while submitting the original order ID', async () => {
+    mock.user.role = 'STAFF';
+    mock.get.mockResolvedValue(
+      response({
+        items: [
+          {
+            id: 'receipt-original',
+            amount: 35000,
+            method: 'CASH',
+            status: 'SUCCESS',
+            paidAt: '2026-11-16T02:00:00Z',
+            orders: [{ tableName: 'Bàn 01', code: 'MC-HIDDEN' }],
+          },
+        ],
+        total: 1,
+        corrections: [],
+        targets: [
+          {
+            _id: '507f1f77bcf86cd799439021',
+            code: 'MC-ONE',
+            tableName: 'Bàn 02',
+            createdAt: '2026-11-16T03:00:00Z',
+            total: 35000,
+            paidAmount: 0,
+          },
+          {
+            _id: '507f1f77bcf86cd799439022',
+            code: 'MC-TWO',
+            tableName: 'Bàn 02',
+            createdAt: '2026-11-16T03:05:00Z',
+            total: 35000,
+            paidAmount: 0,
+          },
+        ],
+      }),
+    );
+    mock.post.mockResolvedValue(response({}));
+    mount(<PaymentAccounting />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Điều chỉnh' }));
+    fireEvent.change(screen.getByLabelText('Loại điều chỉnh'), { target: { value: 'TRANSFER' } });
+    const targets = screen.getByLabelText('Đơn nhận khoản thu');
+    expect(screen.getByRole('option', { name: /Bàn 02.*10:00:00/ })).toBeTruthy();
+    expect(screen.getByRole('option', { name: /Bàn 02.*10:05:00/ })).toBeTruthy();
+    expect(screen.queryByText(/MC-HIDDEN|MC-ONE|MC-TWO|receipt-original/)).toBeNull();
+    fireEvent.change(targets, { target: { value: '507f1f77bcf86cd799439022' } });
+    fireEvent.change(screen.getByLabelText('Lý do'), {
+      target: { value: 'Chuyển khoản thu về đúng đơn' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Gửi quản lý duyệt' }));
+    await waitFor(() =>
+      expect(mock.post).toHaveBeenCalledWith('/staff/payments/receipt-original/corrections', {
+        kind: 'TRANSFER',
+        reason: 'Chuyển khoản thu về đúng đơn',
+        targetOrderId: '507f1f77bcf86cd799439022',
+      }),
+    );
+  });
+  it('defaults to dine-in receipts and opens retired receipts only through the archive tab', async () => {
+    mock.get.mockResolvedValue(response({ items: [], total: 0, corrections: [], targets: [] }));
+    mount(<PaymentAccounting />);
+    await waitFor(() =>
+      expect(mock.get).toHaveBeenCalledWith('/staff/payments?page=1&scope=current'),
+    );
+    fireEvent.click(screen.getByRole('tab', { name: 'Lịch sử đã lưu trữ' }));
+    await waitFor(() =>
+      expect(mock.get).toHaveBeenCalledWith('/staff/payments?page=1&scope=retired'),
+    );
+    expect(screen.getByText(/Khoản thu từ các chức năng đã ngừng/)).toBeTruthy();
+    expect(mock.post).not.toHaveBeenCalled();
+    expect(mock.patch).not.toHaveBeenCalled();
+    expect(mock.delete).not.toHaveBeenCalled();
+  });
+  it('cancels or confirms employee deletion by name', async () => {
+    mock.get.mockResolvedValue(
+      response({
+        users: [
+          {
+            id: 'staff',
+            name: 'Nhân viên A',
+            email: 'staff@test.vn',
+            role: 'STAFF',
+            isActive: true,
+          },
+        ],
+      }),
+    );
+    mock.delete.mockResolvedValue(response({}));
+    mount(<AdminUsers />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Xóa' }));
+    expect(screen.getByRole('dialog', { name: 'Xóa nhân viên?' })).toBeTruthy();
+    expect(screen.getByText('Nhân viên A', { selector: 'strong' })).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Hủy' }));
+    expect(mock.delete).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: 'Xóa' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Xóa nhân viên' }));
+    await waitFor(() => expect(mock.delete).toHaveBeenCalledWith('/admin/users/staff'));
+  });
+
+  it('edits own name and signs out after changing password', async () => {
+    mock.get.mockResolvedValue(response(mock.user));
+    mock.patch.mockResolvedValue(response({ user: { ...mock.user, name: 'Tên mới' } }));
+    mock.post.mockResolvedValue(response({ ok: true }));
+    mount(<AccountPage />);
+    fireEvent.change(await screen.findByLabelText('Họ tên'), { target: { value: 'Tên mới' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Lưu thông tin' }));
+    await waitFor(() => expect(mock.patch).toHaveBeenCalledWith('/auth/me', { name: 'Tên mới' }));
+    fireEvent.change(screen.getByLabelText('Mật khẩu hiện tại'), {
+      target: { value: 'Password@123' },
+    });
+    fireEvent.change(screen.getByLabelText('Mật khẩu mới'), {
+      target: { value: 'NewPassword@123' },
+    });
+    fireEvent.change(screen.getByLabelText('Nhập lại mật khẩu mới'), {
+      target: { value: 'Mismatch@123' },
+    });
+    expect(
+      (screen.getByRole('button', { name: 'Đổi mật khẩu' }) as HTMLButtonElement).disabled,
+    ).toBe(true);
+    fireEvent.change(screen.getByLabelText('Nhập lại mật khẩu mới'), {
+      target: { value: 'NewPassword@123' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Đổi mật khẩu' }));
+    await waitFor(() => expect(mock.clearSession).toHaveBeenCalled());
+    expect(mock.post).toHaveBeenCalledWith('/auth/password', {
+      currentPassword: 'Password@123',
+      newPassword: 'NewPassword@123',
+    });
+  });
+
+  it('disables self lock and confirms another account lock before submitting', async () => {
+    mock.get.mockResolvedValue(
+      response({
+        users: [
+          { ...mock.user, isActive: true },
+          {
+            id: 'staff',
+            name: 'Nhân viên A',
+            email: 'staff@test.vn',
+            role: 'STAFF',
+            isActive: true,
+          },
+        ],
+      }),
+    );
+    mock.patch.mockResolvedValue(response({}));
+    mount(<AdminUsers />);
+    const buttons = await screen.findAllByRole('button', { name: 'Khoá' });
+    expect((buttons[0] as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(buttons[1]!);
+    expect(mock.patch).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: 'Khóa tài khoản' }));
+    await waitFor(() =>
+      expect(mock.patch).toHaveBeenCalledWith('/admin/users/staff', { isActive: false }),
+    );
+  });
+
+  it('requires topping deletion confirmation and offers restore', async () => {
+    const topping = {
+      _id: 'top',
+      name: 'Trân châu',
+      price: 8000,
+      isAvailable: true,
+      isArchived: false,
+    };
+    mock.get.mockResolvedValue(
+      response({ toppings: [topping, { ...topping, _id: 'old', name: 'Kem', isArchived: true }] }),
+    );
+    mock.delete.mockResolvedValue(response({}));
+    mock.patch.mockResolvedValue(response({}));
+    mount(<AdminToppings />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Xóa' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Hủy' }));
+    expect(mock.delete).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: 'Xóa' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Xóa topping' }));
+    await waitFor(() => expect(mock.delete).toHaveBeenCalledWith('/admin/toppings/top'));
+    fireEvent.click(screen.getByText('Topping đã xóa (1)'));
+    fireEvent.click(screen.getByRole('button', { name: 'Khôi phục' }));
+    await waitFor(() =>
+      expect(mock.patch).toHaveBeenCalledWith('/admin/toppings/old', { isArchived: false }),
+    );
+  });
+
+  it('keeps collection time inside details and replaces record codes with human context', async () => {
+    mock.get.mockResolvedValue(
+      response({
+        items: [
+          {
+            id: 'long-payment-id',
+            amount: 35000,
+            method: 'CASH',
+            status: 'SUCCESS',
+            paidAt: '2026-10-15T01:00:00Z',
+            orders: [{ tableName: 'Bàn 01', code: 'MC01' }],
+          },
+        ],
+        total: 1,
+        corrections: [],
+        targets: [],
+      }),
+    );
+    mount(<PaymentAccounting />);
+    const title = (await screen.findAllByText('Bàn 01', { exact: true }))[0]!;
+    expect(title.textContent).not.toContain('MC01');
+    const details = screen.getByText(/^Thu lúc/).closest('details')!;
+    expect(screen.queryByText(/long-payment-id|MC01/)).toBeNull();
+    expect(screen.getByText(/^Thu lúc/).closest('details')).toBe(details);
+    expect(details.open).toBe(false);
+    fireEvent.click(screen.getByText('Chi tiết'));
+    expect(details.open).toBe(true);
+    expect(screen.getByText('Quy định điều chỉnh').closest('details')?.open).toBe(false);
+  });
+});

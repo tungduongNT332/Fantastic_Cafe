@@ -1,0 +1,335 @@
+import { useEffect, useMemo, useState } from 'react';
+import { useQuery } from '@tanstack/react-query';
+import { Search, Sparkles, SlidersHorizontal, X } from 'lucide-react';
+import type { MenuProduct, MenuSearchResponse } from '@may-cafe/contracts';
+import { api, getErrorMessage, unwrap } from '../../lib/api';
+import { cn } from '../../lib/cn';
+import { Input } from '../../components/ui/Input';
+import { Skeleton } from '../../components/ui/Skeleton';
+import { EmptyState, ErrorState } from '../../components/ui/EmptyState';
+import { useDocumentTitle } from '../../components/ui/useDocumentTitle';
+import { ProductDetailModal } from './ProductDetailModal';
+import { ToggleCheck } from './ToggleCheck';
+import { AISheet } from '../ai/AISheet';
+import { MenuShowcase } from './MenuShowcase';
+import { MenuCatalog } from './MenuCatalog';
+import { usePublicMenu } from './usePublicMenu';
+import { useBestSellerIds } from './useBestSellers';
+
+type Product = MenuProduct;
+
+export function MenuPage(): JSX.Element {
+  useDocumentTitle('Menu');
+  const [query, setQuery] = useState('');
+  const [activeCat, setActiveCat] = useState<string | 'all'>('all');
+  const [selected, setSelected] = useState<Product | null>(null);
+  const [aiOpen, setAiOpen] = useState(false);
+  const [debouncedQuery, setDebouncedQuery] = useState('');
+  const [manualFilters, setManualFilters] = useState(false);
+  const [maxBudget, setMaxBudget] = useState('');
+  const [noCaffeine, setNoCaffeine] = useState(false);
+  const [noDairy, setNoDairy] = useState(false);
+
+  const searchText = query.trim();
+  const hasFilters = !!maxBudget || noCaffeine || noDairy;
+  useEffect(() => {
+    const timer = window.setTimeout(() => setDebouncedQuery(searchText), 350);
+    return () => window.clearTimeout(timer);
+  }, [searchText]);
+
+  const menuQuery = usePublicMenu();
+  const bestSellerIds = useBestSellerIds();
+
+  const searchQuery = useQuery({
+    queryKey: ['menu-search', debouncedQuery, maxBudget, noCaffeine, noDairy],
+    queryFn: async ({ signal }) =>
+      unwrap<MenuSearchResponse>(
+        await api.post(
+          '/menu/search',
+          {
+            query: debouncedQuery,
+            ...(hasFilters
+              ? {
+                  filters: {
+                    ...(maxBudget ? { maxBudget: Number(maxBudget) } : {}),
+                    ...(noCaffeine ? { noCaffeine: true } : {}),
+                    ...(noDairy ? { noDairy: true } : {}),
+                  },
+                }
+              : {}),
+          },
+          { signal },
+        ),
+      ),
+    enabled: debouncedQuery.length > 0 || hasFilters,
+    staleTime: 30_000,
+  });
+
+  const searchActive = searchText.length > 0 || hasFilters;
+
+  const filtered = useMemo(() => {
+    if (!menuQuery.data) return [];
+    const byId = new Map(
+      menuQuery.data.products
+        .filter((product) => !product.isArchived)
+        .map((product) => [product._id, product]),
+    );
+    const list = searchActive
+      ? (searchQuery.data?.items
+          .map((item) => byId.get(item.productId))
+          .filter((product): product is Product => !!product) ?? [])
+      : menuQuery.data.products.filter((p) => !p.isArchived);
+    return list.filter((p) => {
+      const inCat = activeCat === 'all' || p.categoryId === activeCat;
+      return inCat;
+    });
+  }, [menuQuery.data, activeCat, searchActive, searchQuery.data]);
+
+  // Chưa tìm kiếm và đang ở "Tất cả": ảnh lớn là các món bán chạy nhất. Còn lại theo danh sách đang lọc.
+  const bestSellers = useMemo(() => {
+    if (searchActive || activeCat !== 'all' || !menuQuery.data || !bestSellerIds.data) return [];
+    const byId = new Map(menuQuery.data.products.map((product) => [product._id, product]));
+    return bestSellerIds.data
+      .map((id) => byId.get(id))
+      .filter((product): product is Product => !!product && !product.isArchived);
+  }, [searchActive, activeCat, menuQuery.data, bestSellerIds.data]);
+  const showBestSellers = bestSellers.length > 0;
+
+  const searchPending = searchActive && (searchQuery.isLoading || debouncedQuery !== searchText);
+  function showSearchResults(): void {
+    setActiveCat('all');
+    setDebouncedQuery(searchText);
+    const catalog = document.getElementById('menu-catalog');
+    catalog?.scrollIntoView({
+      behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth',
+      block: 'start',
+    });
+    catalog?.focus({ preventScroll: true });
+  }
+
+  function clearSearch(): void {
+    setQuery('');
+    setDebouncedQuery('');
+    setManualFilters(false);
+    setMaxBudget('');
+    setNoCaffeine(false);
+    setNoDairy(false);
+    setActiveCat('all');
+  }
+
+  const status =
+    menuQuery.isLoading || searchPending ? (
+      <div className="space-y-4" aria-label="Đang tải thực đơn">
+        <Skeleton className="h-8 w-2/3" />
+        <Skeleton className="h-5 w-full" />
+        <Skeleton className="h-5 w-4/5" />
+      </div>
+    ) : menuQuery.isError ? (
+      <ErrorState message={getErrorMessage(menuQuery.error)} onRetry={() => menuQuery.refetch()} />
+    ) : searchActive && searchQuery.isError ? (
+      <ErrorState
+        message={getErrorMessage(searchQuery.error)}
+        onRetry={() => searchQuery.refetch()}
+      />
+    ) : filtered.length === 0 ? (
+      <EmptyState
+        title="Không có món phù hợp"
+        description={searchQuery.data?.message ?? 'Thử bỏ bộ lọc hoặc đổi từ khóa khác.'}
+      />
+    ) : undefined;
+
+  return (
+    <>
+      <MenuShowcase
+        products={showBestSellers ? bestSellers : filtered}
+        ranked={showBestSellers}
+        categories={menuQuery.data?.categories ?? []}
+        onChoose={setSelected}
+        status={status}
+        compact={searchActive}
+      >
+        <div className="menu-toolbar">
+          <h1 className="sr-only">Thực đơn</h1>
+          <div className="menu-categories no-scrollbar" aria-label="Danh mục món">
+            <Chip active={activeCat === 'all'} onClick={() => setActiveCat('all')}>
+              Tất cả
+            </Chip>
+            {menuQuery.data?.categories.map((category) => (
+              <Chip
+                key={category._id}
+                active={activeCat === category._id}
+                onClick={() => setActiveCat(category._id)}
+              >
+                {category.name}
+              </Chip>
+            ))}
+          </div>
+          <div className="menu-toolbar-actions">
+            <form
+              className="menu-search"
+              role="search"
+              aria-label="Tìm món trong thực đơn"
+              onSubmit={(event) => {
+                event.preventDefault();
+                showSearchResults();
+              }}
+            >
+              <button type="submit" aria-label="Tìm kiếm món" title="Tìm kiếm món">
+                <Search aria-hidden="true" className="h-4 w-4" />
+              </button>
+              <input
+                type="search"
+                value={query}
+                onChange={(event) => {
+                  setQuery(event.target.value);
+                  setActiveCat('all');
+                }}
+                enterKeyHint="search"
+                aria-label="Tìm món"
+                aria-controls="menu-catalog"
+                placeholder="Thử: cà phê không sữa"
+              />
+              {query ? (
+                <button type="button" aria-label="Xóa tìm kiếm" onClick={() => setQuery('')}>
+                  <X className="h-4 w-4" />
+                </button>
+              ) : null}
+            </form>
+            <button
+              type="button"
+              className={cn('menu-tool-button', (manualFilters || hasFilters) && 'is-active')}
+              onClick={() => setManualFilters((value) => !value)}
+              aria-label={manualFilters ? 'Ẩn bộ lọc' : 'Chỉnh bộ lọc'}
+              title={manualFilters ? 'Ẩn bộ lọc' : 'Chỉnh bộ lọc'}
+              aria-expanded={manualFilters}
+            >
+              <SlidersHorizontal className="h-4 w-4" />
+            </button>
+            <button
+              type="button"
+              className="menu-ai-button"
+              aria-label="Hỏi AI Barista"
+              onClick={() => setAiOpen(true)}
+            >
+              <Sparkles className="h-4 w-4" />
+              <span>Hỏi AI Barista</span>
+            </button>
+          </div>
+        </div>
+        {manualFilters ? (
+          <div className="menu-filter-panel">
+            <label className="block text-sm font-semibold">
+              Ngân sách tối đa mỗi món
+              <Input
+                type="number"
+                min="1000"
+                step="1000"
+                value={maxBudget}
+                onChange={(event) => setMaxBudget(event.target.value)}
+                placeholder="Ví dụ 40000"
+                className="mt-2 h-11 rounded-xl font-normal"
+              />
+            </label>
+            <div className="flex flex-wrap gap-2">
+              <ToggleCheck checked={noCaffeine} onChange={setNoCaffeine}>
+                Không caffeine
+              </ToggleCheck>
+              <ToggleCheck checked={noDairy} onChange={setNoDairy}>
+                Không sữa
+              </ToggleCheck>
+            </div>
+            <p className="text-xs text-muted-foreground">Bộ lọc kết hợp với từ khóa đang tìm.</p>
+          </div>
+        ) : null}
+      </MenuShowcase>
+      <MenuCatalog
+        products={searchActive ? filtered : (menuQuery.data?.products ?? [])}
+        categories={menuQuery.data?.categories ?? []}
+        onChoose={setSelected}
+        title={searchActive ? 'Kết quả tìm kiếm' : 'Thực đơn đầy đủ'}
+        intro={
+          searchActive ? (
+            <div className="mb-6 space-y-3">
+              <div className="text-sm" aria-live="polite">
+                {query.trim() ? <p className="mb-2">Kết quả cho “{query.trim()}”</p> : null}
+                {hasFilters ? (
+                  <p className="mb-2 text-muted-foreground">
+                    {[
+                      maxBudget ? `Tối đa ${Number(maxBudget).toLocaleString('vi-VN')}đ` : '',
+                      noCaffeine ? 'Không caffeine' : '',
+                      noDairy ? 'Không sữa' : '',
+                    ]
+                      .filter(Boolean)
+                      .join(' · ')}
+                  </p>
+                ) : null}
+                {searchPending || searchQuery.isFetching ? (
+                  <p>Đang tìm món…</p>
+                ) : searchQuery.isError ? (
+                  <p>Chưa tải được kết quả tìm kiếm.</p>
+                ) : filtered.length > 0 ? (
+                  <p>Tìm thấy {filtered.length} món phù hợp.</p>
+                ) : null}
+              </div>
+              <button type="button" className="btn-outline" onClick={clearSearch}>
+                Xem toàn bộ thực đơn
+              </button>
+            </div>
+          ) : undefined
+        }
+        status={
+          searchActive ? (
+            status
+          ) : menuQuery.isLoading ? (
+            <div
+              className="grid grid-cols-2 gap-4 md:grid-cols-4"
+              aria-label="Đang tải danh sách món"
+            >
+              {Array.from({ length: 4 }, (_, index) => (
+                <Skeleton key={index} className="h-64 rounded-2xl" />
+              ))}
+            </div>
+          ) : menuQuery.isError ? (
+            <ErrorState
+              message={getErrorMessage(menuQuery.error)}
+              onRetry={() => menuQuery.refetch()}
+            />
+          ) : undefined
+        }
+      />
+      <ProductDetailModal
+        product={selected}
+        toppings={menuQuery.data?.toppings ?? []}
+        onClose={() => setSelected(null)}
+        onAdded={() => setSelected(null)}
+      />
+      <AISheet
+        open={aiOpen}
+        onOpenChange={setAiOpen}
+        products={menuQuery.data?.products ?? []}
+        toppings={menuQuery.data?.toppings ?? []}
+      />
+    </>
+  );
+}
+
+function Chip({
+  active,
+  onClick,
+  children,
+}: {
+  active: boolean;
+  onClick: () => void;
+  children: React.ReactNode;
+}): JSX.Element {
+  return (
+    <button
+      type="button"
+      aria-pressed={active}
+      className={cn('menu-category', active && 'is-active')}
+      onClick={onClick}
+    >
+      {children}
+    </button>
+  );
+}

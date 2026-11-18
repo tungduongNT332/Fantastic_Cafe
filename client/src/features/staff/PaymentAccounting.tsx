@@ -1,0 +1,533 @@
+import { orderLabel, recordTime } from '../../lib/recordLabels';
+import { useState } from 'react';
+import { Link } from 'react-router-dom';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { api, unwrap, vnd, getErrorMessage } from '../../lib/api';
+import { useAuth } from '../auth/useAuth';
+import { Button } from '../../components/ui/Button';
+import { Card } from '../../components/ui/Card';
+import { Modal } from '../../components/ui/Modal';
+import { Input } from '../../components/ui/Input';
+import { ErrorState } from '../../components/ui/EmptyState';
+import { useToast } from '../../components/ui/useToast';
+import { useDocumentTitle } from '../../components/ui/useDocumentTitle';
+import { paymentCorrectionRequestSchema, type PaymentMethod } from '@may-cafe/contracts';
+
+interface Receipt {
+  id: string;
+  amount: number;
+  method: PaymentMethod;
+  status: string;
+  paidAt: string;
+  refundedAt: string | null;
+  refundReason: string;
+  reversalKind: string | null;
+  replacesPaymentId: string | null;
+  orders: Array<{ code: string; tableName: string; createdAt?: string } | null>;
+}
+interface Correction {
+  _id: string;
+  paymentId: string;
+  receipt?: Receipt | null;
+  targetOrder?: { code: string; tableName: string; createdAt?: string } | null;
+  kind: 'VOID' | 'METHOD' | 'TRANSFER';
+  reason: string;
+  method: PaymentMethod | null;
+  targetOrderId: string | null;
+  status: string;
+  requestedBy: string;
+  requestedByName: string;
+  decidedByName: string;
+  decisionNote: string;
+  version: number;
+}
+interface Accounting {
+  items: Receipt[];
+  total: number;
+  corrections: Correction[];
+  targets: Array<{
+    _id: string;
+    code: string;
+    tableName?: string;
+    createdAt?: string;
+    total: number;
+    paidAmount?: number;
+  }>;
+}
+const METHODS: Record<PaymentMethod, string> = {
+  CASH: 'Tiền mặt',
+  BANK_TRANSFER: 'Chuyển khoản',
+  OTHER: 'Khác',
+};
+const KINDS = {
+  VOID: 'Hủy ghi nhận thu',
+  METHOD: 'Sửa phương thức',
+  TRANSFER: 'Chuyển sang đúng đơn',
+};
+
+function receiptLocation(receipt: Receipt): string {
+  return [...new Set(receipt.orders.map((order) => order?.tableName ?? 'Đơn đã lưu trữ'))].join(
+    ', ',
+  );
+}
+
+function ReceiptDetails({ receipt }: { receipt: Receipt }): JSX.Element {
+  return (
+    <>
+      <p className="mt-2">
+        Thu lúc {new Date(receipt.paidAt).toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' })}
+      </p>
+      <p className="mt-1">
+        {receipt.orders.map((order) => (order ? orderLabel(order) : 'Đơn đã lưu trữ')).join(', ')}
+      </p>
+      {receipt.replacesPaymentId ? (
+        <p className="mt-1">Đã thay thế khoản thu ghi trước đó</p>
+      ) : null}
+      {receipt.refundedAt ? (
+        <p className="mt-1">
+          {new Date(receipt.refundedAt).toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' })} ·{' '}
+          {receipt.refundReason}
+        </p>
+      ) : null}
+    </>
+  );
+}
+
+export function PaymentAccounting({ admin = false }: { admin?: boolean }): JSX.Element {
+  useDocumentTitle('Khoản thu');
+  const [page, setPage] = useState(1);
+  const [scope, setScope] = useState<'current' | 'retired'>('current');
+  const prefix = admin ? '/admin' : '/staff';
+  const query = useQuery({
+    queryKey: ['payment-accounting', prefix, page, scope],
+    queryFn: async () =>
+      unwrap<Accounting>(await api.get(`${prefix}/payments?page=${page}&scope=${scope}`)),
+    refetchInterval: 5_000,
+  });
+  const [selected, setSelected] = useState<Receipt | null>(null);
+  const [kind, setKind] = useState<Correction['kind']>('METHOD');
+  const [method, setMethod] = useState<PaymentMethod>('CASH');
+  const [targetOrderId, setTarget] = useState('');
+  const [reason, setReason] = useState('');
+  const [decision, setDecision] = useState<{ request: Correction; approve: boolean } | null>(null);
+  const [note, setNote] = useState('');
+  const user = useAuth((state) => state.user);
+  const directAdjustment = user?.role === 'ADMIN';
+  const qc = useQueryClient();
+  const { toast } = useToast();
+  const refresh = () => {
+    for (const key of [
+      'payment-accounting',
+      'staff-awaiting-payments',
+      'staff-orders',
+      'staff-table-sessions',
+      'staff-bill',
+      'cash-shift',
+      'admin-overview',
+    ])
+      void qc.invalidateQueries({ queryKey: [key] });
+  };
+  const fail = (error: unknown) => {
+    refresh();
+    toast({
+      title: 'Chưa xử lý được khoản thu',
+      description: getErrorMessage(error),
+      tone: 'danger',
+    });
+  };
+  const request = useMutation({
+    mutationFn: async () => {
+      if (!selected) throw new Error('Chưa chọn khoản thu.');
+      const payload = paymentCorrectionRequestSchema.parse({
+        kind,
+        reason,
+        ...(kind === 'METHOD' ? { method } : {}),
+        ...(kind === 'TRANSFER' ? { targetOrderId } : {}),
+      });
+      return api.post(
+        directAdjustment
+          ? `/admin/payments/${selected.id}/corrections/apply`
+          : `${prefix}/payments/${selected.id}/corrections`,
+        payload,
+      );
+    },
+    onSuccess: () => {
+      setSelected(null);
+      refresh();
+      toast({
+        title: directAdjustment ? 'Đã điều chỉnh khoản thu' : 'Đã gửi yêu cầu; chờ quản lý duyệt',
+        tone: 'success',
+      });
+    },
+    onError: fail,
+  });
+  const review = useMutation({
+    mutationFn: async (action: { request: Correction; approve: boolean; note: string }) => {
+      return api.post(`/admin/payment-corrections/${action.request._id}/decision`, {
+        approve: action.approve,
+        expectedVersion: action.request.version,
+        note: action.note,
+      });
+    },
+    onSuccess: (_response, action) => {
+      setDecision(null);
+      refresh();
+      toast({
+        title:
+          action.approve && action.request.requestedBy === user?.id
+            ? 'Đã điều chỉnh khoản thu'
+            : 'Đã xử lý yêu cầu điều chỉnh',
+        tone: 'success',
+      });
+    },
+    onError: fail,
+  });
+  if (query.isError)
+    return <ErrorState message={getErrorMessage(query.error)} onRetry={() => query.refetch()} />;
+  const pending = query.data?.corrections.filter((item) => item.status === 'REQUESTED') ?? [];
+  return (
+    <div className="space-y-6">
+      <div>
+        <h1 className="font-display text-2xl font-semibold">Khoản thu</h1>
+        {!admin ? (
+          <p className="mt-2 text-sm text-muted-foreground">
+            Tra cứu và điều chỉnh tiền đã nhận.{' '}
+            <Link
+              to="/staff/tables#awaiting-payments"
+              className="font-semibold text-primary underline"
+            >
+              Nhận tiền tại Bàn & phiên
+            </Link>
+          </p>
+        ) : null}
+
+        <details className="mt-2 text-sm text-muted-foreground">
+          <summary className="cursor-pointer">Quy định điều chỉnh</summary>
+          <p className="mt-2">
+            Nhân viên gửi yêu cầu để Admin duyệt; Admin lưu điều chỉnh trực tiếp. Hủy ghi nhận khi
+            thu nhầm; hoàn tiền thực tế tại đơn. Hủy thu hoặc chuyển đơn chỉ trước pha chế. Sửa
+            phương thức sau đóng phiên được lưu vào lịch sử, giữ nguyên hóa đơn đã chốt.
+          </p>
+        </details>
+      </div>
+      <div className="flex flex-wrap gap-2" role="tablist" aria-label="Phạm vi khoản thu">
+        {(
+          [
+            ['current', 'Khoản thu tại bàn'],
+            ['retired', 'Lịch sử đã lưu trữ'],
+          ] as const
+        ).map(([value, label]) => (
+          <Button
+            key={value}
+            role="tab"
+            aria-selected={scope === value}
+            variant={scope === value ? 'primary' : 'outline'}
+            onClick={() => {
+              setScope(value);
+              setPage(1);
+            }}
+          >
+            {label}
+          </Button>
+        ))}
+      </div>
+      {scope === 'retired' ? (
+        <p className="text-sm text-muted-foreground">
+          Khoản thu từ các chức năng đã ngừng, được giữ để đối soát lịch sử.
+        </p>
+      ) : null}
+      <section className="space-y-3">
+        <h2 className="font-semibold">
+          {admin ? 'Yêu cầu cần xử lý' : 'Chờ duyệt'} ({pending.length})
+        </h2>
+        {!pending.length ? (
+          <p className="text-sm text-muted-foreground">
+            {admin ? 'Không có yêu cầu cần xử lý.' : 'Không có yêu cầu chờ duyệt.'}
+          </p>
+        ) : (
+          pending.map((item) => (
+            <Card key={item._id} className="space-y-2 p-4">
+              <p className="font-semibold">
+                {KINDS[item.kind]} · {item.requestedByName}
+              </p>
+              {item.receipt ? (
+                <p className="text-sm">
+                  {receiptLocation(item.receipt)} · {vnd(item.receipt.amount)} ·{' '}
+                  {METHODS[item.receipt.method]}
+                </p>
+              ) : null}
+              <details className="text-xs text-muted-foreground">
+                <summary className="cursor-pointer">Chi tiết</summary>
+                {item.receipt ? (
+                  <ReceiptDetails receipt={item.receipt} />
+                ) : (
+                  <p className="mt-2">Khoản thu đã lưu trữ</p>
+                )}
+              </details>
+              <p className="text-sm">{item.reason}</p>
+              {item.method ? (
+                <p className="text-sm">Phương thức đúng: {METHODS[item.method]}</p>
+              ) : null}
+              {item.targetOrderId ? (
+                <p className="break-all text-sm">
+                  Đơn nhận: {item.targetOrder ? orderLabel(item.targetOrder) : 'Đơn đã lưu trữ'}
+                </p>
+              ) : null}
+              {admin ? (
+                <div className="flex gap-2">
+                  {[true, false].map((approve) => (
+                    <Button
+                      key={String(approve)}
+                      size="sm"
+                      variant={approve ? 'primary' : 'outline'}
+                      disabled={review.isPending}
+                      onClick={() => {
+                        if (item.requestedBy === user?.id) {
+                          review.mutate({
+                            request: item,
+                            approve,
+                            note: approve ? item.reason : 'Admin bỏ điều chỉnh chưa áp dụng',
+                          });
+                          return;
+                        }
+                        setNote('');
+                        setDecision({ request: item, approve });
+                      }}
+                    >
+                      {approve
+                        ? item.requestedBy === user?.id
+                          ? 'Áp dụng điều chỉnh'
+                          : 'Kiểm tra & duyệt'
+                        : item.requestedBy === user?.id
+                          ? 'Bỏ điều chỉnh'
+                          : 'Từ chối'}
+                    </Button>
+                  ))}
+                </div>
+              ) : (
+                <p className="text-xs text-muted-foreground">
+                  Chờ Admin duyệt trong cổng quản trị.
+                </p>
+              )}
+            </Card>
+          ))
+        )}
+      </section>
+      <section className="space-y-3">
+        <h2 className="font-semibold">Lịch sử khoản thu ({query.data?.total ?? 0})</h2>
+        {query.isLoading ? (
+          <p>Đang tải khoản thu…</p>
+        ) : !query.data?.items.length ? (
+          <p>Chưa có khoản thu.</p>
+        ) : (
+          <div className="grid gap-3 lg:grid-cols-2">
+            {query.data.items.map((item) => (
+              <Card key={item.id} className="space-y-2 p-4">
+                <p className="font-semibold">{receiptLocation(item)}</p>
+                <p>
+                  {vnd(item.amount)} · {METHODS[item.method]}
+                </p>
+                <details className="text-xs text-muted-foreground">
+                  <summary className="cursor-pointer">Chi tiết</summary>
+                  <ReceiptDetails receipt={item} />
+                </details>
+                <p className="text-sm">
+                  {item.status === 'SUCCESS'
+                    ? 'Đã ghi nhận'
+                    : item.reversalKind
+                      ? 'Đã đảo ghi nhận'
+                      : 'Đã hoàn tiền'}
+                </p>
+                {item.status === 'SUCCESS' &&
+                !pending.some((correction) => correction.paymentId === item.id) ? (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => {
+                      setSelected(item);
+                      setReason('');
+                      setKind('METHOD');
+                      setMethod(item.method === 'CASH' ? 'BANK_TRANSFER' : 'CASH');
+                      setTarget('');
+                    }}
+                  >
+                    Điều chỉnh
+                  </Button>
+                ) : null}
+              </Card>
+            ))}
+          </div>
+        )}
+        <div className="flex items-center gap-3">
+          <Button variant="outline" disabled={page === 1} onClick={() => setPage(page - 1)}>
+            Trước
+          </Button>
+          <span>Trang {page}</span>
+          <Button
+            variant="outline"
+            disabled={page * 30 >= (query.data?.total ?? 0)}
+            onClick={() => setPage(page + 1)}
+          >
+            Sau
+          </Button>
+        </div>
+      </section>
+      <section className="space-y-3">
+        <h2 className="font-semibold">Điều chỉnh đã xử lý</h2>
+        {query.data?.corrections
+          .filter((item) => item.status !== 'REQUESTED')
+          .map((item) => (
+            <Card key={item._id} className="p-4 text-sm">
+              <p className="font-semibold">
+                {KINDS[item.kind]} · {item.status === 'APPROVED' ? 'Đã áp dụng' : 'Từ chối'}
+              </p>
+              {item.receipt ? (
+                <p className="text-muted-foreground">
+                  {receiptLocation(item.receipt)} · {vnd(item.receipt.amount)}
+                </p>
+              ) : null}
+              <p>{item.reason}</p>
+              <p>
+                {item.decidedByName}
+                {item.decisionNote && item.decisionNote !== item.reason
+                  ? `: ${item.decisionNote}`
+                  : ''}
+              </p>
+              <details className="text-xs text-muted-foreground">
+                <summary className="cursor-pointer">Chi tiết</summary>
+                {item.receipt ? (
+                  <ReceiptDetails receipt={item.receipt} />
+                ) : (
+                  <p className="mt-2">Khoản thu đã lưu trữ</p>
+                )}
+              </details>
+            </Card>
+          ))}
+      </section>
+      <Modal
+        open={!!selected}
+        onOpenChange={(open) => {
+          if (!open && !request.isPending) setSelected(null);
+        }}
+        title={directAdjustment ? 'Điều chỉnh khoản thu' : 'Yêu cầu điều chỉnh khoản thu'}
+      >
+        <div className="space-y-4">
+          <p>
+            {selected ? vnd(selected.amount) : ''} ·{' '}
+            {selected ? `${receiptLocation(selected)} · ${recordTime(selected.paidAt)}` : ''}
+          </p>
+          <label className="block">
+            Loại điều chỉnh
+            <select
+              className="mt-1 w-full rounded border p-2"
+              value={kind}
+              onChange={(event) => setKind(event.target.value as Correction['kind'])}
+            >
+              {Object.entries(KINDS).map(([value, label]) => (
+                <option key={value} value={value}>
+                  {label}
+                </option>
+              ))}
+            </select>
+          </label>
+          {kind === 'METHOD' ? (
+            <label className="block">
+              Phương thức đúng
+              <select
+                className="mt-1 w-full rounded border p-2"
+                value={method}
+                onChange={(event) => setMethod(event.target.value as PaymentMethod)}
+              >
+                {Object.entries(METHODS).map(([value, label]) => (
+                  <option key={value} value={value}>
+                    {label}
+                  </option>
+                ))}
+              </select>
+            </label>
+          ) : null}
+          {kind === 'TRANSFER' ? (
+            <label className="block">
+              Đơn nhận khoản thu
+              <select
+                className="mt-1 w-full rounded border p-2"
+                value={targetOrderId}
+                onChange={(event) => setTarget(event.target.value)}
+              >
+                <option value="">Chọn đơn đang chờ thanh toán</option>
+                {query.data?.targets.map((order) => (
+                  <option key={order._id} value={order._id}>
+                    {orderLabel(order)} · Còn thiếu {vnd(order.total - (order.paidAmount ?? 0))}
+                  </option>
+                ))}
+              </select>
+            </label>
+          ) : null}
+          {kind === 'VOID' ? (
+            <p className="text-sm">
+              Đảo khoản thu đã ghi nhầm và mở lại dư nợ. Thao tác này không chuyển tiền hay ghi nhận
+              hoàn tiền cho khách.
+            </p>
+          ) : null}
+          <label className="block">
+            Lý do
+            <Input
+              value={reason}
+              maxLength={280}
+              onChange={(event) => setReason(event.target.value)}
+            />
+          </label>
+          <Button
+            disabled={
+              request.isPending ||
+              reason.trim().length < 3 ||
+              (kind === 'TRANSFER' && !targetOrderId)
+            }
+            onClick={() => request.mutate()}
+          >
+            {directAdjustment ? 'Lưu điều chỉnh' : 'Gửi quản lý duyệt'}
+          </Button>
+        </div>
+      </Modal>
+      <Modal
+        open={!!decision}
+        onOpenChange={(open) => {
+          if (!open && !review.isPending) setDecision(null);
+        }}
+        title={decision?.approve ? 'Duyệt điều chỉnh khoản thu' : 'Từ chối điều chỉnh'}
+      >
+        <div className="space-y-4">
+          <p>
+            {decision ? KINDS[decision.request.kind] : ''} · {decision?.request.reason}
+          </p>
+          {decision?.request.receipt ? (
+            <p>
+              {decision.request.receipt.orders
+                .map((order) => (order ? orderLabel(order) : 'Đơn đã lưu trữ'))
+                .join(', ')}{' '}
+              · {vnd(decision.request.receipt.amount)} · {METHODS[decision.request.receipt.method]}
+            </p>
+          ) : null}
+          {decision?.request.method ? (
+            <p>Phương thức đúng: {METHODS[decision.request.method]}</p>
+          ) : null}
+          {decision?.request.targetOrder ? (
+            <p>Chuyển sang {orderLabel(decision.request.targetOrder)}</p>
+          ) : null}
+          <label className="block">
+            Ghi chú kiểm tra
+            <Input value={note} maxLength={280} onChange={(event) => setNote(event.target.value)} />
+          </label>
+          <Button
+            disabled={review.isPending || note.trim().length < 3}
+            onClick={() => {
+              if (decision) review.mutate({ ...decision, note });
+            }}
+          >
+            {decision?.approve ? 'Xác nhận duyệt' : 'Xác nhận từ chối'}
+          </Button>
+        </div>
+      </Modal>
+    </div>
+  );
+}

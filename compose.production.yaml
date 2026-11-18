@@ -1,0 +1,291 @@
+name: maycafe-production
+
+services:
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    command: ['mongod', '--replSet', 'rs0', '--bind_ip_all']
+    volumes:
+      - mongo_production_data:/data/db
+      - ./scripts/mongo-init.js:/docker-entrypoint-initdb.d/init-replica.js:ro
+    healthcheck:
+      test: |
+        mongosh --quiet --eval "
+          try { rs.status().ok } catch (e) {
+            if (e.codeName === 'NotYetInitialized' || e.codeName === 'InvalidReplicaSetConfig') rs.initiate({_id:'rs0',members:[{_id:0,host:'mongo:27017'}]})
+            else throw e
+          }
+        "
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ['redis-server', '--appendonly', 'yes', '--maxmemory-policy', 'noeviction']
+    volumes:
+      - redis_production_data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  server-guest-a: &server
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: server
+    restart: unless-stopped
+    environment: &server-environment
+      NODE_ENV: production
+      PORT: 4000
+      TRUST_PROXY_HOPS: 1
+      SHUTDOWN_TIMEOUT_MS: 10000
+      PUBLIC_APP_URL: ${PUBLIC_APP_URL:-http://localhost:8080}
+      STAFF_APP_URL: ${STAFF_APP_URL:-http://localhost:8081}
+      ADMIN_APP_URL: ${ADMIN_APP_URL:-http://localhost:8082}
+      SERVER_ORIGIN: ${SERVER_ORIGIN:-http://localhost:8080}
+      COOKIE_DOMAIN: ${COOKIE_DOMAIN:-}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      MONGODB_URI: mongodb://mongo:27017/${MONGO_DATABASE:-maycafe}?replicaSet=rs0&directConnection=true
+      REDIS_URL: redis://redis:6379
+      TRAFFIC_CLASS: guest
+      INSTANCE_ID: server-guest-a
+      RATE_LIMIT_AUTH_MAX: ${RATE_LIMIT_AUTH_MAX:-30}
+      RATE_LIMIT_GUEST_MUTATION_MAX: ${RATE_LIMIT_GUEST_MUTATION_MAX:-60}
+      RATE_LIMIT_GUEST_JOIN_MAX: ${RATE_LIMIT_GUEST_JOIN_MAX:-20}
+      RATE_LIMIT_GUEST_ORDER_MAX: ${RATE_LIMIT_GUEST_ORDER_MAX:-12}
+      RATE_LIMIT_GUEST_QUOTE_MAX: ${RATE_LIMIT_GUEST_QUOTE_MAX:-60}
+      RATE_LIMIT_GUEST_SERVICE_MAX: ${RATE_LIMIT_GUEST_SERVICE_MAX:-6}
+      RATE_LIMIT_MENU_SEARCH_MAX: ${RATE_LIMIT_MENU_SEARCH_MAX:-120}
+      RATE_LIMIT_AI_MAX: ${RATE_LIMIT_AI_MAX:-20}
+      MENU_CACHE_TTL_SECONDS: ${MENU_CACHE_TTL_SECONDS:-60}
+      ORDER_QUOTE_TTL_MS: ${ORDER_QUOTE_TTL_MS:-120000}
+      BACKGROUND_JOB_POLL_MS: ${BACKGROUND_JOB_POLL_MS:-250}
+      BACKGROUND_JOB_MAX_ATTEMPTS: ${BACKGROUND_JOB_MAX_ATTEMPTS:-3}
+      BACKGROUND_JOB_RESULT_TTL_SECONDS: ${BACKGROUND_JOB_RESULT_TTL_SECONDS:-900}
+      BACKGROUND_JOB_RESULT_MAX_BYTES: ${BACKGROUND_JOB_RESULT_MAX_BYTES:-5242880}
+      BACKGROUND_JOB_LEASE_MS: ${BACKGROUND_JOB_LEASE_MS:-30000}
+      BACKGROUND_JOB_RETRY_BASE_MS: ${BACKGROUND_JOB_RETRY_BASE_MS:-1000}
+      BACKGROUND_JOB_RETRY_MAX_MS: ${BACKGROUND_JOB_RETRY_MAX_MS:-60000}
+      WORKER_HEARTBEAT_INTERVAL_MS: ${WORKER_HEARTBEAT_INTERVAL_MS:-5000}
+      WORKER_HEARTBEAT_TTL_MS: ${WORKER_HEARTBEAT_TTL_MS:-20000}
+      OUTBOX_POLL_MS: ${OUTBOX_POLL_MS:-250}
+      OUTBOX_BATCH_SIZE: ${OUTBOX_BATCH_SIZE:-50}
+      OUTBOX_LEASE_MS: ${OUTBOX_LEASE_MS:-30000}
+      OUTBOX_MAX_ATTEMPTS: ${OUTBOX_MAX_ATTEMPTS:-20}
+      OUTBOX_RETRY_BASE_MS: ${OUTBOX_RETRY_BASE_MS:-1000}
+      OUTBOX_RETRY_MAX_MS: ${OUTBOX_RETRY_MAX_MS:-60000}
+      JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:-}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:-}
+      ACCESS_TOKEN_TTL: ${ACCESS_TOKEN_TTL:-15m}
+      REFRESH_TOKEN_TTL: ${REFRESH_TOKEN_TTL:-30d}
+      GUEST_AUTO_OPEN: ${GUEST_AUTO_OPEN:-true}
+      SESSION_IDLE_TIMEOUT_MIN: ${SESSION_IDLE_TIMEOUT_MIN:-60}
+      AI_MODE: ${AI_MODE:-fallback}
+      ANOMALY_AI_MODE: ${ANOMALY_AI_MODE:-fallback}
+      AI_PROVIDER: ${AI_PROVIDER:-openai}
+      AI_MODEL: ${AI_MODEL:-}
+      AI_API_KEY: ${AI_API_KEY:-}
+      AI_BASE_URL: ${AI_BASE_URL:-https://api.openai.com/v1}
+      AI_TIMEOUT_MS: ${AI_TIMEOUT_MS:-15000}
+      ANOMALY_ENABLED: ${ANOMALY_ENABLED:-true}
+      ANOMALY_INTERVAL_MS: ${ANOMALY_INTERVAL_MS:-60000}
+      ANOMALY_WINDOW_MIN: ${ANOMALY_WINDOW_MIN:-15}
+      ANOMALY_BASELINE_MIN: ${ANOMALY_BASELINE_MIN:-60}
+      ANOMALY_MIN_SAMPLES: ${ANOMALY_MIN_SAMPLES:-20}
+      ANOMALY_ERROR_RATE: ${ANOMALY_ERROR_RATE:-0.1}
+      ANOMALY_LATENCY_P95_MS: ${ANOMALY_LATENCY_P95_MS:-1000}
+      ANOMALY_PREPARATION_P95_SECONDS: ${ANOMALY_PREPARATION_P95_SECONDS:-900}
+      ANOMALY_CANCELLATION_RATE: ${ANOMALY_CANCELLATION_RATE:-0.25}
+      ANOMALY_BASELINE_MULTIPLIER: ${ANOMALY_BASELINE_MULTIPLIER:-2}
+      ANOMALY_COOLDOWN_MIN: ${ANOMALY_COOLDOWN_MIN:-30}
+      ANOMALY_AI_MAX_PER_RUN: ${ANOMALY_AI_MAX_PER_RUN:-3}
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        [
+          'CMD',
+          'node',
+          '-e',
+          "fetch('http://127.0.0.1:4000/readyz').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
+    stop_grace_period: 15s
+    cpus: '${GUEST_API_CPUS:-0.75}'
+    mem_limit: ${GUEST_API_MEMORY_LIMIT:-384m}
+    mem_reservation: ${GUEST_API_MEMORY_RESERVATION:-192m}
+    cpu_shares: 512
+    pids_limit: 128
+
+  migrate:
+    <<: *server
+    command: ['node', 'server/dist/scripts/migrate.js']
+    restart: 'no'
+    environment:
+      <<: *server-environment
+      TRAFFIC_CLASS: internal
+      INSTANCE_ID: migration-runner
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      disable: true
+
+  server-guest-b:
+    <<: *server
+    environment:
+      <<: *server-environment
+      TRAFFIC_CLASS: guest
+      INSTANCE_ID: server-guest-b
+
+  server-internal-a:
+    <<: *server
+    environment:
+      <<: *server-environment
+      TRAFFIC_CLASS: internal
+      INSTANCE_ID: server-internal-a
+    cpus: '${INTERNAL_API_CPUS:-0.75}'
+    mem_limit: ${INTERNAL_API_MEMORY_LIMIT:-384m}
+    mem_reservation: ${INTERNAL_API_MEMORY_RESERVATION:-192m}
+    cpu_shares: 1536
+
+  server-internal-b:
+    <<: *server
+    environment:
+      <<: *server-environment
+      TRAFFIC_CLASS: internal
+      INSTANCE_ID: server-internal-b
+    cpus: '${INTERNAL_API_CPUS:-0.75}'
+    mem_limit: ${INTERNAL_API_MEMORY_LIMIT:-384m}
+    mem_reservation: ${INTERNAL_API_MEMORY_RESERVATION:-192m}
+    cpu_shares: 1536
+
+  worker-scheduler:
+    <<: *server
+    command: ['node', 'server/dist/src/worker.js']
+    environment:
+      <<: *server-environment
+      TRAFFIC_CLASS: internal
+      INSTANCE_ID: worker-scheduler-1
+      WORKER_ROLE: scheduler
+    healthcheck:
+      test:
+        [
+          'CMD',
+          'node',
+          '-e',
+          "import('ioredis').then(async m=>{const r=new m.default(process.env.REDIS_URL);const v=await r.get('maycafe:worker:worker-scheduler-1');r.disconnect();if(!v||Date.now()-Date.parse(JSON.parse(v).updatedAt)>Number(process.env.WORKER_HEARTBEAT_TTL_MS))process.exit(1)}).catch(()=>process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    cpus: '${WORKER_CPUS:-0.50}'
+    mem_limit: ${WORKER_MEMORY_LIMIT:-384m}
+    mem_reservation: ${WORKER_MEMORY_RESERVATION:-192m}
+    cpu_shares: 256
+
+  worker-realtime:
+    <<: *server
+    command: ['node', 'server/dist/src/worker.js']
+    environment:
+      <<: *server-environment
+      TRAFFIC_CLASS: internal
+      INSTANCE_ID: worker-realtime-1
+      WORKER_ROLE: realtime
+    healthcheck:
+      test:
+        [
+          'CMD',
+          'node',
+          '-e',
+          "import('ioredis').then(async m=>{const r=new m.default(process.env.REDIS_URL);const v=await r.get('maycafe:worker:worker-realtime-1');r.disconnect();const h=v&&JSON.parse(v);if(!h||!h.lastProgressAt||Date.now()-Date.parse(h.lastProgressAt)>Number(process.env.WORKER_HEARTBEAT_TTL_MS))process.exit(1)}).catch(()=>process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    cpus: '${REALTIME_WORKER_CPUS:-0.25}'
+    mem_limit: ${WORKER_MEMORY_LIMIT:-384m}
+    mem_reservation: ${WORKER_MEMORY_RESERVATION:-192m}
+    cpu_shares: 512
+
+  worker-report:
+    <<: *server
+    command: ['node', 'server/dist/src/worker.js']
+    environment:
+      <<: *server-environment
+      TRAFFIC_CLASS: internal
+      INSTANCE_ID: worker-report-1
+      WORKER_ROLE: report
+    healthcheck:
+      test:
+        [
+          'CMD',
+          'node',
+          '-e',
+          "import('ioredis').then(async m=>{const r=new m.default(process.env.REDIS_URL);const v=await r.get('maycafe:worker:worker-report-1');r.disconnect();const h=v&&JSON.parse(v);if(!h||!h.lastProgressAt||Date.now()-Date.parse(h.lastProgressAt)>Number(process.env.WORKER_HEARTBEAT_TTL_MS))process.exit(1)}).catch(()=>process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    cpus: '${REPORT_WORKER_CPUS:-0.50}'
+    mem_limit: ${REPORT_WORKER_MEMORY_LIMIT:-512m}
+    mem_reservation: ${WORKER_MEMORY_RESERVATION:-192m}
+    cpu_shares: 128
+
+  web:
+    build:
+      context: .
+      dockerfile: client/Dockerfile
+      args:
+        VITE_GUEST_APP_URL: ${PUBLIC_APP_URL:-http://localhost:8080}
+        VITE_STAFF_APP_URL: ${STAFF_APP_URL:-http://localhost:8081}
+        VITE_ADMIN_APP_URL: ${ADMIN_APP_URL:-http://localhost:8082}
+        VITE_SUPPORT_TELEGRAM_URL: ${VITE_SUPPORT_TELEGRAM_URL-https://t.me/cafe_sky_cskh_bot}
+        VITE_SHOW_DEMO_CREDENTIALS: ${VITE_SHOW_DEMO_CREDENTIALS:-false}
+    restart: unless-stopped
+    ports:
+      - '${WEB_PORT:-8080}:8080'
+      - '${STAFF_WEB_PORT:-8081}:8081'
+      - '${ADMIN_WEB_PORT:-8082}:8082'
+    depends_on:
+      server-guest-a:
+        condition: service_healthy
+      server-guest-b:
+        condition: service_healthy
+      server-internal-a:
+        condition: service_healthy
+      server-internal-b:
+        condition: service_healthy
+    healthcheck:
+      test: ['CMD', 'wget', '-q', '--spider', 'http://127.0.0.1:8080/healthz']
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    cpus: '${WEB_CPUS:-0.50}'
+    mem_limit: ${WEB_MEMORY_LIMIT:-192m}
+    mem_reservation: ${WEB_MEMORY_RESERVATION:-64m}
+    cpu_shares: 1024
+    pids_limit: 64
+
+volumes:
+  mongo_production_data:
+  redis_production_data:

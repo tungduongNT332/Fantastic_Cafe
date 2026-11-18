@@ -1,0 +1,19 @@
+{
+  "name": "Fantastic Cafe — Gọi món tại bàn",
+  "short_name": "Fantastic Cafe",
+  "description": "Quét QR, gọi món và theo dõi đơn tại Fantastic Cafe.",
+  "lang": "vi",
+  "start_url": "/t",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#f8f7f5",
+  "theme_color": "#f8f7f5",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

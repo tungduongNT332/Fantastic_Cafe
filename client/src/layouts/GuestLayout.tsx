@@ -1,0 +1,332 @@
+import { Outlet, NavLink, useNavigate, useLocation } from 'react-router-dom';
+import { ShoppingBag, LogOut, BellRing, QrCode, MessageCircle } from 'lucide-react';
+import { useCart, cartTotals } from '../store/cart';
+import { api, unwrap, vnd, getErrorMessage } from '../lib/api';
+import { useQuery, useQueryClient, useMutation } from '@tanstack/react-query';
+import { useEffect, useRef, useState } from 'react';
+import { connectGuestSocket, disconnectSocket, useSocketEvent } from '../lib/socket';
+import { Button } from '../components/ui/Button';
+import { useToast } from '../components/ui/useToast';
+import { cn } from '../lib/cn';
+import { CloudMark } from '../features/guest/CloudMark';
+import type { GuestContext } from '../features/guest/guestContext';
+import type { CurrentTableSessionResponse } from '@may-cafe/contracts';
+import { useGifts } from '../features/gifts/useGifts';
+import { getSupportTelegramUrl } from '../lib/support';
+import '../features/guest/menu-showcase.css';
+import { GuestDock } from './GuestDock';
+
+const supportUrl = getSupportTelegramUrl();
+
+export function GuestLayout(): JSX.Element {
+  const navigate = useNavigate();
+  const location = useLocation();
+  const showcase = location.pathname === '/menu';
+  useEffect(() => {
+    document.scrollingElement?.scrollTo?.({ top: 0, left: 0, behavior: 'auto' });
+  }, [location.pathname]);
+  const qc = useQueryClient();
+  const { toast } = useToast();
+  const items = useCart((s) => s.items);
+  const setSession = useCart((s) => s.setSession);
+  const resetSession = useCart((s) => s.resetSession);
+  const { count, subtotal } = cartTotals(items);
+  const [connected, setConnected] = useState(false);
+  const sessionQuery = useQuery({
+    queryKey: ['guest-session'],
+    queryFn: async () =>
+      unwrap(await api.get<CurrentTableSessionResponse>('/table-sessions/current')),
+    refetchInterval: 10_000,
+  });
+  const session = sessionQuery.data;
+  const activeSession = session?.active ? session : undefined;
+  const activeParticipantId = activeSession?.participantId;
+  const giftOwner = activeSession
+    ? `${activeSession.tableSessionId}:${activeSession.participantId}`
+    : null;
+  const gifts = useGifts(giftOwner);
+  const giftCount = gifts.data?.incomingCount ?? 0;
+  const previousGifts = useRef<{ owner: string | null; count: number } | null>(null);
+  useEffect(() => {
+    if (!gifts.data) return;
+    if (previousGifts.current?.owner === giftOwner && giftCount > previousGifts.current.count)
+      toast({
+        title: 'Bàn bạn có quà mới',
+        description: 'Mở Tặng quà để nhận hoặc từ chối.',
+        tone: 'info',
+      });
+    previousGifts.current = { owner: giftOwner, count: giftCount };
+  }, [giftCount, giftOwner, gifts.data, toast]);
+  const receiptAvailable = session?.active === false && session.receiptAvailable;
+  const refreshSession = () => {
+    void qc.invalidateQueries({ queryKey: ['guest-session'] });
+  };
+  const refreshOrders = () => {
+    void qc.invalidateQueries({ queryKey: ['my-orders'] });
+    void qc.invalidateQueries({ queryKey: ['member'] });
+    void qc.invalidateQueries({ queryKey: ['member-points'] });
+  };
+  useSocketEvent('connect', () => {
+    setConnected(true);
+    refreshSession();
+    refreshOrders();
+    void qc.invalidateQueries({ queryKey: ['gifts'] });
+    void qc.invalidateQueries({ queryKey: ['menu'] });
+  });
+  useSocketEvent('disconnect', () => {
+    setConnected(false);
+    refreshSession();
+  });
+  useSocketEvent('order.statusChanged', refreshOrders);
+  useSocketEvent('gift.changed', () => {
+    void qc.invalidateQueries({ queryKey: ['gifts'] });
+  });
+  useSocketEvent('order.created', refreshOrders);
+  useSocketEvent('menu.availabilityChanged', () => {
+    void qc.invalidateQueries({ queryKey: ['menu'] });
+    void qc.invalidateQueries({ queryKey: ['menu-search'] });
+  });
+  useSocketEvent('tableSession.statusChanged', refreshSession);
+  useSocketEvent('payment.confirmed', () => {
+    refreshOrders();
+    refreshSession();
+    void qc.invalidateQueries({ queryKey: ['receipt'] });
+    navigate('/receipt');
+  });
+  useSocketEvent('serviceRequest.resolved', () =>
+    toast({ title: 'Nhân viên đã xử lý yêu cầu của bạn', tone: 'success' }),
+  );
+
+  useEffect(() => {
+    if (session?.active && session.tableSessionId && session.participantId)
+      setSession(session.tableSessionId, session.participantId);
+    else if (session && !session.active) {
+      resetSession();
+      if (session.receiptAvailable && !['/receipt', '/member', '/ai'].includes(location.pathname))
+        navigate('/receipt', { replace: true });
+    }
+  }, [session, setSession, resetSession, navigate, location.pathname]);
+
+  useEffect(() => {
+    if (!activeParticipantId) return;
+    const socket = connectGuestSocket(activeParticipantId);
+    setConnected(socket.connected);
+    return () => {
+      disconnectSocket();
+      setConnected(false);
+    };
+  }, [activeParticipantId]);
+
+  const callStaff = useMutation({
+    mutationFn: () => api.post('/service-requests', { type: 'CALL_STAFF' }),
+    onSuccess: () =>
+      toast({
+        title: 'Đã gọi nhân viên',
+        description: 'Nhân viên sẽ đến hỗ trợ bạn.',
+        tone: 'success',
+      }),
+    onError: (e) =>
+      toast({ title: 'Chưa gửi được yêu cầu', description: getErrorMessage(e), tone: 'danger' }),
+  });
+  const leave = useMutation({
+    mutationFn: () => api.post('/table-sessions/leave'),
+    onSuccess: () => {
+      disconnectSocket();
+      resetSession();
+      qc.removeQueries({ queryKey: ['my-orders'] });
+      qc.removeQueries({ queryKey: ['receipt'] });
+      qc.setQueryData(['member'], { member: null });
+      qc.setQueryData(['guest-session'], { active: false });
+      navigate('/t');
+    },
+    onError: (e) =>
+      toast({ title: 'Chưa rời được bàn', description: getErrorMessage(e), tone: 'danger' }),
+  });
+
+  const showCartPill = count > 0 && !!activeSession && location.pathname !== '/cart';
+  const supportHref = activeSession || receiptAvailable ? supportUrl : null;
+  const context: GuestContext = { tableName: activeSession?.table?.name ?? null };
+
+  return (
+    <div
+      className={cn(
+        'guest-shell flex min-h-dvh flex-col bg-background',
+        showcase && 'guest-showcase',
+      )}
+    >
+      <header className="guest-header sticky top-0 z-30 border-b border-border bg-background/95 backdrop-blur print:hidden">
+        <div className="mx-auto flex w-full max-w-[1600px] flex-wrap items-center gap-2 px-4 py-2 sm:gap-3 lg:px-6 min-[1200px]:flex-nowrap">
+          <NavLink
+            to="/menu"
+            aria-label="Thực đơn Fantastic Cafe"
+            className="shrink-0 rounded focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary"
+          >
+            <CloudMark className="h-6 w-8 text-primary" />
+          </NavLink>
+          <div className="min-w-[9rem] flex-1 leading-tight min-[1200px]:w-[9.5rem] min-[1200px]:flex-none">
+            <p className="g-title text-lg">Fantastic Cafe</p>
+            <p className="flex items-center gap-1.5 truncate text-xs text-muted-foreground">
+              {activeSession ? (
+                <>
+                  <span
+                    aria-hidden="true"
+                    className={cn(
+                      'h-2 w-2 shrink-0 rounded-full',
+                      connected ? 'bg-success' : 'bg-foreground/25',
+                    )}
+                  />
+                  <span className="sr-only">{connected ? 'Đã kết nối' : 'Đang kết nối lại'}</span>
+                  <span className="font-semibold text-foreground">
+                    {activeSession.table?.name ?? 'Đang vào bàn'}
+                  </span>
+                  {activeSession.status === 'CHECKOUT' ? (
+                    <span className="rounded-full bg-accent/30 px-2 py-0.5 font-medium text-foreground">
+                      Đang thanh toán
+                    </span>
+                  ) : null}
+                </>
+              ) : receiptAvailable ? (
+                'Đã kết thúc phiên'
+              ) : (
+                'Chưa vào bàn'
+              )}
+            </p>
+          </div>
+          <nav
+            aria-label="Điều hướng chính"
+            className="guest-header-nav hidden min-w-0 flex-wrap items-center justify-center gap-0 lg:order-last lg:flex lg:basis-full min-[1200px]:order-none min-[1200px]:flex-1 min-[1200px]:basis-auto [&>*]:shrink-0 [&>*]:whitespace-nowrap"
+          >
+            {[
+              { to: '/menu', label: 'Thực đơn' },
+              { to: '/ai', label: 'AI Barista' },
+              ...(activeSession
+                ? [{ to: '/gifts', label: `Tặng quà${giftCount ? ` (${giftCount})` : ''}` }]
+                : []),
+              ...(activeSession ? [{ to: '/jukebox', label: 'Chọn nhạc' }] : []),
+              {
+                to: receiptAvailable ? '/receipt' : '/orders',
+                label: receiptAvailable ? 'Hóa đơn' : 'Đơn của tôi',
+              },
+            ].map((item) => (
+              <NavLink
+                key={item.to}
+                to={item.to}
+                className={({ isActive }) =>
+                  cn(
+                    'shrink-0 whitespace-nowrap rounded-full px-2.5 py-2 text-xs font-semibold transition focus:outline-none focus-visible:ring-2 focus-visible:ring-primary',
+                    isActive
+                      ? 'bg-primary text-primary-foreground'
+                      : 'text-muted-foreground hover:bg-card hover:text-foreground',
+                  )
+                }
+              >
+                {item.label}
+              </NavLink>
+            ))}
+            {activeSession ? (
+              <Button
+                variant="ghost"
+                className="px-2.5 text-xs"
+                onClick={() => callStaff.mutate()}
+                disabled={callStaff.isPending}
+              >
+                <BellRing className="h-4 w-4" /> Gọi nhân viên
+              </Button>
+            ) : null}
+            {supportHref ? (
+              <a
+                href={supportHref}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex shrink-0 items-center gap-2 whitespace-nowrap rounded-full px-2.5 py-2 text-xs font-semibold text-muted-foreground transition hover:bg-card hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+              >
+                <MessageCircle className="h-4 w-4" /> Hỗ trợ CSKH
+              </a>
+            ) : null}
+          </nav>
+          <NavLink
+            to="/member"
+            className="shrink-0 rounded-full px-3 py-2 text-sm font-semibold hover:bg-card"
+          >
+            Thành viên
+          </NavLink>
+          {activeSession || receiptAvailable ? (
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() => leave.mutate()}
+              disabled={leave.isPending}
+            >
+              <LogOut className="h-4 w-4" /> Rời bàn
+            </Button>
+          ) : null}
+        </div>
+      </header>
+
+      <main
+        className={cn(
+          showcase
+            ? 'w-full flex-1'
+            : 'mx-auto w-full max-w-6xl flex-1 px-4 pt-5 lg:px-6 lg:pt-8 print:pb-0',
+          !showcase && (showCartPill ? 'pb-56 lg:pb-32' : 'pb-36 lg:pb-12'),
+        )}
+      >
+        {receiptAvailable ? (
+          <div className="mb-4 flex flex-wrap items-center justify-between gap-3 border-l-4 border-accent bg-card py-3 pl-4 pr-3 text-sm print:hidden">
+            <p>Phiên trước đã thanh toán. Quét QR tại bàn để mở phiên mới.</p>
+            <Button size="sm" onClick={() => navigate('/t')}>
+              <QrCode className="h-4 w-4" /> Quét lại QR
+            </Button>
+          </div>
+        ) : null}
+        {giftCount > 0 && location.pathname !== '/gifts' && (
+          <NavLink
+            to="/gifts"
+            role="status"
+            className="mx-4 mb-4 block rounded-2xl border border-primary/40 bg-card p-4 font-semibold"
+          >
+            🎁 Bàn bạn có {giftCount} lời mời tặng quà · Mở để nhận hoặc từ chối
+          </NavLink>
+        )}
+        <Outlet context={context} />
+      </main>
+
+      <div className="safe-bottom pointer-events-none fixed inset-x-0 bottom-0 z-30 print:hidden">
+        <div className="mx-auto max-w-md space-y-2 px-3 pb-3 lg:mr-6 lg:max-w-sm lg:pb-6">
+          {showCartPill ? (
+            <button
+              type="button"
+              onClick={() => navigate('/cart')}
+              disabled={activeSession?.status !== 'OPEN'}
+              className="pill-in pointer-events-auto flex h-14 w-full items-center gap-3 rounded-full bg-primary pl-2 pr-5 text-primary-foreground shadow-soft transition hover:bg-primary/95 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 disabled:opacity-60"
+            >
+              <span className="relative grid h-10 w-10 place-items-center rounded-full bg-primary-foreground/15">
+                <ShoppingBag className="h-5 w-5" />
+                <span className="absolute -right-1 -top-1 grid h-5 min-w-5 place-items-center rounded-full bg-accent px-1 text-xs font-bold text-accent-foreground tabular-nums">
+                  {count}
+                </span>
+              </span>
+              <span className="flex-1 text-left leading-tight">
+                <span className="block text-xs opacity-80">
+                  {activeSession?.status === 'OPEN'
+                    ? `${count} món trong giỏ`
+                    : 'Bàn đang thanh toán'}
+                </span>
+                <span className="block font-semibold tabular-nums">{vnd(subtotal)}</span>
+              </span>
+              <span className="font-semibold">Xem giỏ</span>
+            </button>
+          ) : null}
+          <GuestDock
+            active={!!activeSession}
+            receiptAvailable={!!receiptAvailable}
+            giftCount={giftCount}
+            supportHref={supportHref}
+            calling={callStaff.isPending}
+            onCallStaff={() => callStaff.mutate()}
+          />
+        </div>
+      </div>
+    </div>
+  );
+}
